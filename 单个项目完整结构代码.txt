@@ -1,0 +1,474 @@
+项目 'askaiquestions-2api' 的结构树:
+📂 askaiquestions-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 askai_provider.py
+            📄 base_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# [自动填充] askaiquestions-2api 生产环境配置
+# 该文件由 Project Chimera 自动生成，可直接用于一键部署。
+
+# --- 安全配置 ---
+# 用于保护您的 API 服务的访问密钥，请按需修改为您自己的复杂密钥。
+API_MASTER_KEY=1
+
+# --- 端口配置 ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# askaiquestions-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的配置。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-askai-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for askaiquestions-2api (v1.0 - High-Speed Pseudo-Stream)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动 (使用多个 worker 以处理并发请求)
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: askaiquestions-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - askai-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: askaiquestions-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - askai-net
+
+networks:
+  askai-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.core.config import settings
+from app.providers.askai_provider import AskAIProvider
+
+# --- 日志配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- 全局 Provider 实例 ---
+provider = AskAIProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 '高速伪流' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        # 检查是否是流式请求
+        is_stream = request_data.get("stream", False)
+        return await provider.chat_completion(request_data, is_stream)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream askai_backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://askai_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+httpx
+pydantic-settings
+python-dotenv
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "askaiquestions-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 askaiquestions.net 转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = None
+    
+    API_REQUEST_TIMEOUT: int = 120
+    NGINX_PORT: int = 8088
+
+    DEFAULT_MODEL: str = "askai-default-model"
+    KNOWN_MODELS: List[str] = ["askai-default-model"]
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\askai_provider.py ---
+
+import httpx
+import json
+import time
+import logging
+import uuid
+import asyncio
+from typing import Dict, Any, AsyncGenerator, Union
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import (
+    create_sse_data, 
+    create_chat_completion_chunk, 
+    create_non_stream_chat_completion,
+    DONE_CHUNK
+)
+
+logger = logging.getLogger(__name__)
+
+class AskAIProvider(BaseProvider):
+    def __init__(self):
+        self.client = httpx.AsyncClient(timeout=settings.API_REQUEST_TIMEOUT)
+        self.api_url = "https://pjfuothbq9.execute-api.us-east-1.amazonaws.com/get-summary"
+
+    async def chat_completion(self, request_data: Dict[str, Any], stream: bool) -> Union[StreamingResponse, JSONResponse]:
+        
+        full_text, request_id, model = await self._get_upstream_response(request_data)
+
+        if stream:
+            return StreamingResponse(
+                self._stream_generator(full_text, request_id, model), 
+                media_type="text/event-stream"
+            )
+        else:
+            completion_data = create_non_stream_chat_completion(request_id, model, full_text)
+            return JSONResponse(content=completion_data)
+
+    async def _get_upstream_response(self, request_data: Dict[str, Any]) -> (str, str, str):
+        """
+        统一处理上游请求，返回 (响应文本, 请求ID, 模型名称)。
+        """
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        model = request_data.get("model", settings.DEFAULT_MODEL)
+        
+        try:
+            payload = self._prepare_payload(request_data)
+            headers = self._prepare_headers()
+
+            response = await self.client.post(self.api_url, headers=headers, json=payload)
+            response.raise_for_status()
+            
+            # 应用【模式：JSON-in-Text-Parsing】
+            response_text = response.text
+            data = json.loads(response_text)
+            
+            summary = data.get("summary")
+            if summary is None:
+                raise ValueError("上游响应的 JSON 中缺少 'summary' 字段。")
+            
+            return summary, request_id, model
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"请求上游 API 时发生 HTTP 错误: {e.response.status_code} - {e.response.text}", exc_info=True)
+            raise HTTPException(status_code=e.response.status_code, detail=f"上游服务错误: {e.response.text}")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"解析上游响应时出错: {e}", exc_info=True)
+            raise HTTPException(status_code=502, detail=f"无法解析上游服务响应: {e}")
+        except Exception as e:
+            logger.error(f"请求上游时发生未知错误: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"内部服务器错误: {e}")
+
+    async def _stream_generator(self, full_text: str, request_id: str, model: str) -> AsyncGenerator[bytes, None]:
+        """
+        应用【模式：高速分块伪流】
+        """
+        try:
+            # 为了达到 1000 tokens/s 的感知速度，我们每次发送2个字符，延迟1毫秒
+            chunk_size = 2
+            delay = 0.001 
+            
+            for i in range(0, len(full_text), chunk_size):
+                chunk_content = full_text[i:i+chunk_size]
+                chunk = create_chat_completion_chunk(request_id, model, chunk_content)
+                yield create_sse_data(chunk)
+                await asyncio.sleep(delay)
+            
+            # 发送结束标志
+            final_chunk = create_chat_completion_chunk(request_id, model, "", "stop")
+            yield create_sse_data(final_chunk)
+            yield DONE_CHUNK
+        except Exception as e:
+            logger.error(f"流生成器发生错误: {e}", exc_info=True)
+            error_chunk = create_chat_completion_chunk(request_id, model, f"内部错误: {e}", "stop")
+            yield create_sse_data(error_chunk)
+            yield DONE_CHUNK
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "accept": "*/*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "content-type": "application/json",
+            "origin": "https://askaiquestions.net",
+            "referer": "https://askaiquestions.net/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+        }
+
+    def _prepare_payload(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        messages = request_data.get("messages", [])
+        if not messages:
+            raise HTTPException(status_code=400, detail="请求体中缺少 'messages' 字段。")
+        
+        return {
+            "website": "ask-ai-questions",
+            "messages": messages
+        }
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Union
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any],
+        stream: bool
+    ) -> Union[StreamingResponse, JSONResponse]:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+def create_non_stream_chat_completion(
+    request_id: str,
+    model: str,
+    content: str
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的非流式聊天补全响应。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+
